@@ -1,0 +1,107 @@
+name: Build APK and Site
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      # يبحث عن المشروع: إما مفكوكًا في المستودع، أو داخل أي ملف zip (أينما كان وأيًّا كان اسمه)
+      - name: Locate project
+        run: |
+          SETTINGS=$(find . -name settings.gradle -not -path './work/*' | head -1)
+          if [ -z "$SETTINGS" ]; then
+            ZIP=$(find . -name '*.zip' -not -path './work/*' | head -1)
+            if [ -z "$ZIP" ]; then echo "لا يوجد مشروع ولا ملف zip في المستودع"; ls -R | head -50; exit 1; fi
+            echo "Found zip: $ZIP"
+            mkdir -p work && unzip -q -o "$ZIP" -d work
+            SETTINGS=$(find work -name settings.gradle | head -1)
+          fi
+          if [ -z "$SETTINGS" ]; then echo "settings.gradle not found"; exit 1; fi
+          echo "ROOT=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+          echo "Project root: $(dirname "$SETTINGS")"
+
+      # يفك مفتاح التوقيع من الأسرار (إن وُجد) ليُوقَّع الـ APK توقيع إصدار حقيقي
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "Signing with release key"
+          else
+            echo "::warning::KEYSTORE_BASE64 secret not set - APK will be signed with the debug key (not suitable for stores)"
+          fi
+
+      - name: Build release APK
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          cd "$ROOT"
+          set +e
+          gradle assembleRelease --no-daemon --stacktrace > build.log 2>&1
+          CODE=$?
+          if [ $CODE -ne 0 ]; then
+            echo "===== سبب الفشل (ابعت صورة من هنا) ====="
+            grep -n -m1 -A12 "What went wrong" build.log
+            grep -n -m10 "error:" build.log
+            MSG=$(grep -m1 -A6 "What went wrong" build.log | tr '\n' ' ')
+            echo "::error title=Build failed::$MSG"
+            ERRS=$(grep -m5 "error:" build.log | tr '\n' ' ')
+            [ -n "$ERRS" ] && echo "::error title=Compile errors::$ERRS"
+            exit 1
+          fi
+
+      - name: Copy APK
+        run: cp "$ROOT/app/build/outputs/apk/release/app-release.apk" "90-yawm-taghyeer-v${{ github.run_number }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 90-yawm-taghyeer-apk
+          path: 90-yawm-taghyeer-v${{ github.run_number }}.apk
+
+      # ينشر ريليز جديد في صفحة Releases مع ملف الـ APK
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: 90 يوم تغيير — نسخة ${{ github.run_number }}
+          body: تطبيق 90 يوم تغيير. حمّل ملف APK من الأسفل (Assets) وثبّته على الجوال.
+          files: 90-yawm-taghyeer-v${{ github.run_number }}.apk
+          make_latest: true
+
+      # ينشر موقع التطبيق (مجلد docs) على فرع gh-pages (لا يعتمد على خيار GitHub Actions في Pages)
+      - name: Publish site to gh-pages branch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$ROOT/docs"
+          touch .nojekyll
+          git init -q -b gh-pages
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -qm "Deploy site"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages:gh-pages
